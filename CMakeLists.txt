@@ -302,6 +302,7 @@ option(NO_LIB "Disable the opensubdiv libs build (caveat emptor)" OFF)
 option(NO_EXAMPLES "Disable examples build" OFF)
 option(NO_TUTORIALS "Disable tutorials build" OFF)
 option(NO_REGRESSION "Disable regression tests build" OFF)
+option(NO_CAPI "Disable the C-compatible API (capi) build" OFF)
 option(NO_PTEX "Disable Ptex example viewers" OFF)
 option(NO_DOC "Disable documentation build" OFF)
 option(NO_OMP "Disable OpenMP backend" OFF)
@@ -871,6 +872,10 @@ if (OSD_USES_STRINGIFY_TOOL_BINARY)
 endif()
 
 add_subdirectory(opensubdiv)
+
+if (NOT NO_CAPI)
+    add_subdirectory(capi)
+endif()
 
 if (NOT ANDROID) # XXXdyu
     add_subdirectory(regression)
