@@ -82,9 +82,28 @@ OSD_CAPI_EXPORT void SetUVs(
     const float* uvs,
     const int* faceUVIndices);
 
+// Sets per-vertex scalar attributes (e.g. thickness and extrusion offsets)
+// interpolated with the same stencils as positions.
+//   scalars           : vertexCount * channelsPerVertex floats
+//   channelsPerVertex : 1..16
+// Must be called before Subdivide().
+OSD_CAPI_EXPORT void SetVertexScalars(
+    SubdivMesh* mesh,
+    int channelsPerVertex,
+    const float* scalars);
+
+// Sets the face-varying (UV) interpolation rule, matching
+// Sdc::Options::FVarLinearInterpolation:
+//   0 = NONE (smooth everywhere), 1 = CORNERS_ONLY, 2 = CORNERS_PLUS1,
+//   3 = CORNERS_PLUS2, 4 = BOUNDARIES, 5 = ALL (fully linear).
+// Default is 0 (smooth). Must be called before Subdivide().
+OSD_CAPI_EXPORT void SetFVarLinearInterpolation(
+    SubdivMesh* mesh,
+    int mode);
+
 // Uniformly subdivides the mesh to the given level (>= 1) using the
-// Catmull-Clark scheme. Positions and UVs are interpolated to the last level.
-// Returns true on success.
+// Catmull-Clark scheme. Positions, scalars and UVs are interpolated to the
+// last level. Returns true on success.
 OSD_CAPI_EXPORT bool Subdivide(
     SubdivMesh* mesh,
     int subdivisionLevel);
@@ -108,6 +127,16 @@ OSD_CAPI_EXPORT void GetUVs(
     SubdivMesh* mesh,
     float* output);
 
+// Number of per-vertex scalar floats at the last refined level
+// (vertex count * channels, 0 if not subdivided or SetVertexScalars() was
+// not called).
+OSD_CAPI_EXPORT int GetScalarCount(SubdivMesh* mesh);
+
+// Copies GetScalarCount() floats into output.
+OSD_CAPI_EXPORT void GetScalars(
+    SubdivMesh* mesh,
+    float* output);
+
 // Number of faces at the last refined level (0 if not subdivided).
 OSD_CAPI_EXPORT int GetFaceCount(SubdivMesh* mesh);
 
@@ -120,6 +149,19 @@ OSD_CAPI_EXPORT void GetFaceVertexCounts(
 // Copies the refined face vertex indices into output.
 // output must have room for sum(GetFaceVertexCounts()) ints.
 OSD_CAPI_EXPORT void GetFaceVertexIndices(
+    SubdivMesh* mesh,
+    int* output);
+
+// Copies one face-varying UV value index per face corner of the last refined
+// level (sum(GetFaceVertexCounts()) entries) into output. Filled with -1 when
+// SetUVs() was not called.
+OSD_CAPI_EXPORT void GetFaceUVIndices(
+    SubdivMesh* mesh,
+    int* output);
+
+// Copies the coarse face index each refined face was derived from into
+// output (GetFaceCount() entries; uniform refinement only).
+OSD_CAPI_EXPORT void GetFaceParentFaces(
     SubdivMesh* mesh,
     int* output);
 

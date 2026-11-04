@@ -84,6 +84,18 @@ int main(void) {
     // UVs: one per corner, mapping corners to their vertex UV.
     SetUVs(mesh, 8, &g_uvs[0][0], g_vertIndices);
 
+    // Per-vertex scalars (2 channels): constant and vertex-index ramp.
+    {
+        float scalars[8 * 2];
+        for (int i = 0; i < 8; ++i) {
+            scalars[i * 2 + 0] = 1.0f;
+            scalars[i * 2 + 1] = (float) i;
+        }
+        SetVertexScalars(mesh, 2, scalars);
+    }
+
+    SetFVarLinearInterpolation(mesh, 0 /* smooth everywhere */);
+
     // Invalid subdivision levels must fail.
     CHECK(Subdivide(mesh, 0) == false);
 
@@ -139,21 +151,121 @@ int main(void) {
 
         float uvs[EXPECTED_VERTS * 2];
         GetUVs(mesh, uvs);
-        int foundUVOrigin = 0;
+
+        // Smooth face-varying interpolation keeps the UV field continuous and
+        // bounded near the coarse [0,1]^2 range (corner values blend slightly
+        // at creased cube corners).
         for (int i = 0; i < numUVs; ++i) {
-            if (fabsf(uvs[i * 2 + 0] - 0.0f) < 1e-5f &&
-                fabsf(uvs[i * 2 + 1] - 0.0f) < 1e-5f) {
-                foundUVOrigin = 1;
-                break;
+            CHECK(uvs[i * 2 + 0] > -0.25f && uvs[i * 2 + 0] < 1.25f);
+            CHECK(uvs[i * 2 + 1] > -0.25f && uvs[i * 2 + 1] < 1.25f);
+        }
+
+        // Face-varying value indices: one per corner, in range.
+        {
+            int faceUVIndices[EXPECTED_INDICES];
+            GetFaceUVIndices(mesh, faceUVIndices);
+            for (int i = 0; i < EXPECTED_INDICES; ++i) {
+                CHECK(faceUVIndices[i] >= 0 && faceUVIndices[i] < numUVs);
             }
         }
-        CHECK(foundUVOrigin);
+
+        // Parent faces: every refined face maps into a coarse face.
+        {
+            int parentFaces[EXPECTED_FACES];
+            GetFaceParentFaces(mesh, parentFaces);
+            for (int i = 0; i < numFaces; ++i) {
+                CHECK(parentFaces[i] >= 0 && parentFaces[i] < 6);
+            }
+        }
+
+        // Scalars: constant channel stays 1 everywhere, ramp channel stays
+        // within [0, 7] and both survive the full refinement.
+        {
+            int const numScalars = GetScalarCount(mesh);
+            CHECK(numScalars == EXPECTED_VERTS * 2);
+
+            float scalarOut[EXPECTED_VERTS * 2];
+            GetScalars(mesh, scalarOut);
+
+            float rampMin = 1e9f, rampMax = -1e9f;
+            for (int i = 0; i < EXPECTED_VERTS; ++i) {
+                CHECK(fabsf(scalarOut[i * 2 + 0] - 1.0f) < 1e-5f);
+                float const r = scalarOut[i * 2 + 1];
+                if (r < rampMin) rampMin = r;
+                if (r > rampMax) rampMax = r;
+            }
+
+            // The uncreased cube smooths every vertex, so the ramp converges
+            // toward its mean (3.5) but must never leave the coarse range.
+            CHECK(rampMin > -1e-3f && rampMin < 3.5f);
+            CHECK(rampMax > 3.5f && rampMax < 7.0f + 1e-3f);
+        }
     }
 
     // A mesh cannot be subdivided twice.
     CHECK(Subdivide(mesh, LEVEL) == false);
 
     DestroyMesh(mesh);
+
+    // Open mesh (single quad, like the welded armor cage): open edges are
+    // auto-sharpened, so the surface must stay planar-ish within its coarse
+    // bounds and the scalar/UV ranges must never leave the coarse hull.
+    {
+        float quadVerts[4][3] = {{ -0.5f, -0.5f, 0.0f },
+                                 {  0.5f, -0.5f, 0.0f },
+                                 {  0.5f,  0.5f, 0.0f },
+                                 { -0.5f,  0.5f, 0.0f }};
+        int quadFaces[1] = { 4 };
+        int quadIndices[4] = { 0, 1, 2, 3 };
+        float quadUvs[4][2] = {{ 0.0f, 0.0f }, { 1.0f, 0.0f },
+                               { 1.0f, 1.0f }, { 0.0f, 1.0f }};
+        float quadScalars[4 * 2];
+        for (int i = 0; i < 4; ++i) {
+            quadScalars[i * 2 + 0] = 1.0f;
+            quadScalars[i * 2 + 1] = (float) i;
+        }
+
+        SubdivMesh * open = CreateMesh(4, &quadVerts[0][0], 1, quadFaces, quadIndices);
+        CHECK(open != NULL);
+        if (open) {
+            SetUVs(open, 4, &quadUvs[0][0], quadIndices);
+            SetVertexScalars(open, 2, quadScalars);
+            CHECK(Subdivide(open, 2) == true);
+
+            int const openVerts = GetVertexCount(open);
+            CHECK(openVerts == 25);   // 4 + 4 + 1 + 12 + 4
+
+            float openPositions[25 * 3];
+            GetPositions(open, openPositions);
+
+            for (int i = 0; i < openVerts; ++i) {
+                for (int k = 0; k < 3; ++k) {
+                    CHECK(openPositions[i * 3 + k] > -0.5f - 1e-4f);
+                    CHECK(openPositions[i * 3 + k] <  0.5f + 1e-4f);
+                }
+            }
+
+            float openScalars[25 * 2];
+            CHECK(GetScalarCount(open) == 25 * 2);
+            GetScalars(open, openScalars);
+            for (int i = 0; i < openVerts; ++i) {
+                CHECK(fabsf(openScalars[i * 2 + 0] - 1.0f) < 1e-5f);
+                CHECK(openScalars[i * 2 + 1] > -1e-4f);
+                CHECK(openScalars[i * 2 + 1] <  3.0f + 1e-4f);
+            }
+
+            int openUVs = GetUVCount(open);
+            CHECK(openUVs == openVerts);   // smooth fvar channel tracks vertices
+
+            int openFaceUVIndices[16 * 4];
+            GetFaceUVIndices(open, openFaceUVIndices);
+            for (int i = 0; i < 16 * 4; ++i) {
+                CHECK(openFaceUVIndices[i] >= 0 && openFaceUVIndices[i] < openUVs);
+            }
+
+            DestroyMesh(open);
+        }
+    }
 
     // NULL/edge cases must not crash.
     DestroyMesh(NULL);

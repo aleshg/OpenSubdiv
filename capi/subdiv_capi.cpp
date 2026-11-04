@@ -13,6 +13,7 @@
 #include <cstring>
 #include <memory>
 #include <new>
+#include <numeric>
 #include <vector>
 
 using namespace OpenSubdiv;
@@ -61,6 +62,27 @@ struct CapiUV {
     float value[2];
 };
 
+// Generic per-vertex scalar primvar (interpolated like positions). The channel
+// count is a runtime property of the mesh; unused channels stay zero.
+struct CapiScalars {
+
+    CapiScalars() {
+        for (int i = 0; i < 16; ++i) value[i] = 0.0f;
+    }
+    CapiScalars(CapiScalars const & src) {
+        for (int i = 0; i < 16; ++i) value[i] = src.value[i];
+    }
+
+    void Clear(void * = 0) {
+        for (int i = 0; i < 16; ++i) value[i] = 0.0f;
+    }
+    void AddWithWeight(CapiScalars const & src, float weight) {
+        for (int i = 0; i < 16; ++i) value[i] += weight * src.value[i];
+    }
+
+    float value[16];
+};
+
 } // anonymous namespace
 
 //
@@ -76,17 +98,26 @@ struct SubdivMesh {
     std::vector<float> creaseSharpness;   // creaseCount
     std::vector<float> coarseUVs;         // uvCount * 2
     std::vector<int>   faceUVIndices;     // sum(faceVertexCounts)
+    std::vector<float> coarseScalars;     // vertexCount * scalarChannels
+    int                scalarChannels;
+    int                fvarInterpolation; // Sdc::Options::FVarLinearInterpolation
     bool hasUVs;
+    bool hasScalars;
 
     // Refined results (last level only).
     bool refined;
     int  level;
     std::vector<CapiPosition> positions;
     std::vector<CapiUV>       uvs;
+    std::vector<float>        scalars;         // lastLevelVerts * scalarChannels
     std::vector<int>          faceCounts;
     std::vector<int>          faceIndices;
+    std::vector<int>          refinedFaceUVIndices;  // sum(faceCounts)
+    std::vector<int>          faceParentFaces;       // faceCount
 
-    SubdivMesh() : hasUVs(false), refined(false), level(0) { }
+    SubdivMesh()
+        : scalarChannels(0), fvarInterpolation(0),
+          hasUVs(false), hasScalars(false), refined(false), level(0) { }
 };
 
 namespace {
@@ -161,6 +192,8 @@ refineInternal(SubdivMesh & mesh, int level) {
 
     Sdc::Options options;
     options.SetVtxBoundaryInterpolation(Sdc::Options::VTX_BOUNDARY_EDGE_ONLY);
+    options.SetFVarLinearInterpolation(
+        (Sdc::Options::FVarLinearInterpolation) mesh.fvarInterpolation);
 
     std::unique_ptr<Far::TopologyRefiner> refiner(
         Far::TopologyRefinerFactory<Far::TopologyDescriptor>::Create(
@@ -193,10 +226,24 @@ refineInternal(SubdivMesh & mesh, int level) {
         }
     }
 
+    // Interpolate per-vertex scalar attributes level by level.
+    int const scalarChannels = mesh.scalarChannels;
+    std::vector<CapiScalars> scalars;
+    if (mesh.hasScalars) {
+        scalars.resize((size_t) numTotalVerts);
+        for (int i = 0; i < desc.numVertices; ++i) {
+            for (int c = 0; c < scalarChannels; ++c) {
+                scalars[(size_t) i].value[c] =
+                    mesh.coarseScalars[(size_t) i * scalarChannels + c];
+            }
+        }
+    }
+
     Far::PrimvarRefiner primvarRefiner(*refiner);
 
     CapiPosition * srcPos = &positions[0];
     CapiUV *       srcUV  = mesh.hasUVs ? &uvs[0] : 0;
+    CapiScalars *  srcScl = mesh.hasScalars ? &scalars[0] : 0;
 
     for (int current = 1; current <= level; ++current) {
         int const numPrevVerts = refiner->GetLevel(current - 1).GetNumVertices();
@@ -204,6 +251,12 @@ refineInternal(SubdivMesh & mesh, int level) {
         CapiPosition * dstPos = srcPos + numPrevVerts;
         primvarRefiner.Interpolate(current, srcPos, dstPos);
         srcPos = dstPos;
+
+        if (mesh.hasScalars) {
+            CapiScalars * dstScl = srcScl + numPrevVerts;
+            primvarRefiner.Interpolate(current, srcScl, dstScl);
+            srcScl = dstScl;
+        }
 
         if (mesh.hasUVs) {
             int const numPrevValues =
@@ -223,6 +276,18 @@ refineInternal(SubdivMesh & mesh, int level) {
 
     mesh.positions.assign(positions.begin() + offsetLastVerts, positions.end());
 
+    if (mesh.hasScalars) {
+        int const numLastVerts = lastLevel.GetNumVertices();
+        size_t const offsetLastScalars = positions.size() - numLastVerts;
+
+        mesh.scalars.reserve((size_t) numLastVerts * scalarChannels);
+        for (size_t i = offsetLastScalars; i < scalars.size(); ++i) {
+            for (int c = 0; c < scalarChannels; ++c) {
+                mesh.scalars.push_back(scalars[i].value[c]);
+            }
+        }
+    }
+
     if (mesh.hasUVs) {
         int const numLastValues    = lastLevel.GetNumFVarValues(0);
         int const offsetLastValues = (int) uvs.size() - numLastValues;
@@ -231,6 +296,8 @@ refineInternal(SubdivMesh & mesh, int level) {
 
     mesh.faceCounts.clear();
     mesh.faceIndices.clear();
+    mesh.refinedFaceUVIndices.clear();
+    mesh.faceParentFaces.clear();
 
     int const numFaces = lastLevel.GetNumFaces();
     mesh.faceCounts.reserve((size_t) numFaces);
@@ -240,6 +307,22 @@ refineInternal(SubdivMesh & mesh, int level) {
         for (int i = 0; i < faceVerts.size(); ++i) {
             mesh.faceIndices.push_back(faceVerts[i]);
         }
+
+        if (mesh.hasUVs) {
+            Far::ConstIndexArray faceUVs =
+                lastLevel.GetFaceFVarValues(face, 0);
+            for (int i = 0; i < faceUVs.size(); ++i) {
+                mesh.refinedFaceUVIndices.push_back(faceUVs[i]);
+            }
+        }
+
+        // GetFaceParentFace maps into the previous level; resolve the chain
+        // up to the coarse (level 0) face.
+        int parent = lastLevel.GetFaceParentFace(face);
+        for (int current = level - 1; current >= 1; --current) {
+            parent = refiner->GetLevel(current).GetFaceParentFace(parent);
+        }
+        mesh.faceParentFaces.push_back(parent);
     }
 
     mesh.refined = true;
@@ -342,6 +425,44 @@ SetUVs(SubdivMesh* mesh, int uvCount,
     }
 }
 
+OSD_CAPI_EXPORT void
+SetVertexScalars(SubdivMesh* mesh, int channelsPerVertex,
+                 const float* scalars) {
+
+    if (!mesh || mesh->refined) {
+        return;
+    }
+    if (channelsPerVertex < 1 || channelsPerVertex > 16 || !scalars) {
+        return;
+    }
+
+    int const numVertices = (int) mesh->coarsePositions.size() / 3;
+
+    try {
+        mesh->coarseScalars.assign(scalars,
+                                   scalars + (size_t) numVertices * channelsPerVertex);
+        mesh->scalarChannels = channelsPerVertex;
+        mesh->hasScalars = true;
+    } catch (...) {
+        mesh->coarseScalars.clear();
+        mesh->scalarChannels = 0;
+        mesh->hasScalars = false;
+    }
+}
+
+OSD_CAPI_EXPORT void
+SetFVarLinearInterpolation(SubdivMesh* mesh, int mode) {
+
+    if (!mesh || mesh->refined) {
+        return;
+    }
+    if (mode < 0 || mode > 5) {
+        return;
+    }
+
+    mesh->fvarInterpolation = mode;
+}
+
 OSD_CAPI_EXPORT bool
 Subdivide(SubdivMesh* mesh, int subdivisionLevel) {
 
@@ -387,6 +508,23 @@ GetUVs(SubdivMesh* mesh, float* output) {
 }
 
 OSD_CAPI_EXPORT int
+GetScalarCount(SubdivMesh* mesh) {
+
+    // The scalar buffer already stores all channels interleaved.
+    return (mesh && mesh->refined && mesh->hasScalars) ?
+        (int) mesh->scalars.size() : 0;
+}
+
+OSD_CAPI_EXPORT void
+GetScalars(SubdivMesh* mesh, float* output) {
+
+    if (mesh && mesh->refined && mesh->hasScalars && output) {
+        std::memcpy(output, &mesh->scalars[0],
+                    mesh->scalars.size() * sizeof(float));
+    }
+}
+
+OSD_CAPI_EXPORT int
 GetFaceCount(SubdivMesh* mesh) {
 
     return (mesh && mesh->refined) ? (int) mesh->faceCounts.size() : 0;
@@ -407,6 +545,34 @@ GetFaceVertexIndices(SubdivMesh* mesh, int* output) {
     if (mesh && mesh->refined && output) {
         std::memcpy(output, &mesh->faceIndices[0],
                     mesh->faceIndices.size() * sizeof(int));
+    }
+}
+
+OSD_CAPI_EXPORT void
+GetFaceUVIndices(SubdivMesh* mesh, int* output) {
+
+    if (!mesh || !mesh->refined || !output) {
+        return;
+    }
+
+    if (mesh->hasUVs) {
+        std::memcpy(output, &mesh->refinedFaceUVIndices[0],
+                    mesh->refinedFaceUVIndices.size() * sizeof(int));
+    } else {
+        int const total = std::accumulate(mesh->faceCounts.begin(),
+                                          mesh->faceCounts.end(), 0);
+        for (int i = 0; i < total; ++i) {
+            output[i] = -1;
+        }
+    }
+}
+
+OSD_CAPI_EXPORT void
+GetFaceParentFaces(SubdivMesh* mesh, int* output) {
+
+    if (mesh && mesh->refined && output) {
+        std::memcpy(output, &mesh->faceParentFaces[0],
+                    mesh->faceParentFaces.size() * sizeof(int));
     }
 }
 
