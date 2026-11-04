@@ -191,7 +191,7 @@ refineInternal(SubdivMesh & mesh, int level) {
     Sdc::SchemeType const scheme = Sdc::SCHEME_CATMARK;
 
     Sdc::Options options;
-    options.SetVtxBoundaryInterpolation(Sdc::Options::VTX_BOUNDARY_EDGE_ONLY);
+    options.SetVtxBoundaryInterpolation(Sdc::Options::VTX_BOUNDARY_EDGE_AND_CORNER);
     options.SetFVarLinearInterpolation(
         (Sdc::Options::FVarLinearInterpolation) mesh.fvarInterpolation);
 
